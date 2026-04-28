@@ -4,9 +4,10 @@
  * Flow:
  *   1. User types /ask [question] in Slack
  *   2. Slack POSTs to this server
- *   3. Server fetches candidate files from Google Drive
- *   4. Server calls Claude API with files + system prompt
- *   5. Answer is posted back to Slack
+ *   3. Server immediately acknowledges (within 3s)
+ *   4. Server fetches candidate files from Google Drive
+ *   5. Server calls Claude API with files + system prompt
+ *   6. Answer is posted back to Slack via response_url
  */
 
 import express from "express";
@@ -21,69 +22,49 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ── Clients ──────────────────────────────────────────────────────────────────
+// ── Clients ───────────────────────────────────────────────────────────────────
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// Google Drive auth — reads credentials from an environment variable (not a file)
-// Paste the entire contents of your service-account-key.json as the value of
-// GOOGLE_SERVICE_ACCOUNT_JSON in your .env / Railway dashboard.
 const serviceAccountKey = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-
 const auth = new google.auth.GoogleAuth({
   credentials: serviceAccountKey,
   scopes: ["https://www.googleapis.com/auth/drive.readonly"],
 });
 const drive = google.drive({ version: "v3", auth });
 
-// ── Config ───────────────────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
 
 const DRIVE_ROOT_FOLDER_ID = process.env.DRIVE_ROOT_FOLDER_ID;
-// ^ This is the root folder: 1PTZRt3NL5OZO5I-gghxvx4J-H6PMtddS
-// The bot will search ALL subfolders automatically.
-
-const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
 
 // ── Google Drive helpers ──────────────────────────────────────────────────────
 
-/**
- * Recursively list all files under a folder (up to maxFiles).
- */
 async function listAllFiles(folderId, maxFiles = 60) {
   const files = [];
   const queue = [folderId];
 
   while (queue.length > 0 && files.length < maxFiles) {
     const currentFolder = queue.shift();
-
     const res = await drive.files.list({
       q: `'${currentFolder}' in parents and trashed = false`,
       fields: "files(id, name, mimeType)",
       pageSize: 100,
     });
-
     for (const file of res.data.files || []) {
       if (file.mimeType === "application/vnd.google-apps.folder") {
-        queue.push(file.id); // recurse into subfolders
+        queue.push(file.id);
       } else {
         files.push(file);
       }
     }
   }
-
   return files;
 }
 
-/**
- * Download/export a file's text content from Drive.
- * Handles Google Docs (export as plain text) and regular files.
- */
 async function getFileText(file) {
   try {
     let content = "";
-
     if (file.mimeType === "application/vnd.google-apps.document") {
-      // Export Google Doc as plain text
       const res = await drive.files.export(
         { fileId: file.id, mimeType: "text/plain" },
         { responseType: "text" }
@@ -93,12 +74,10 @@ async function getFileText(file) {
       file.mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
       file.mimeType === "application/msword"
     ) {
-      // For .docx files: export via Drive's conversion
       const res = await drive.files.export(
         { fileId: file.id, mimeType: "text/plain" },
         { responseType: "text" }
       ).catch(async () => {
-        // Fallback: download raw and treat as text
         const raw = await drive.files.get(
           { fileId: file.id, alt: "media" },
           { responseType: "text" }
@@ -113,13 +92,11 @@ async function getFileText(file) {
       );
       content = res.data;
     } else {
-      // PDF or other binary — skip for now, or add pdf parsing here
       return null;
     }
-
     return {
       name: file.name,
-      content: String(content).slice(0, 8000), // cap per file to avoid token overflow
+      content: String(content).slice(0, 8000),
     };
   } catch (err) {
     console.error(`Failed to read file ${file.name}:`, err.message);
@@ -154,32 +131,14 @@ Guidelines:
 
 Respond in a clear, professional tone. Use bullet points and structure when helpful.`;
 
-// ── Main route: handles /ask slash command ────────────────────────────────────
+// ── Background processor ──────────────────────────────────────────────────────
 
-app.post("/slack/ask", async (req, res) => {
-  const { text, user_name, channel_id, response_url } = req.body;
-
-  if (!text || text.trim() === "") {
-    return res.json({
-      response_type: "ephemeral",
-      text: "Please provide a question. Usage: `/ask Who is the best candidate for Head of FSSC?`",
-    });
-  }
-
-  // Acknowledge immediately so Slack doesn't time out (3s limit)
-  res.json({
-    response_type: "in_channel",
-    text: `🔍 *${user_name}* asked: _${text}_\n⏳ Looking through the candidate files...`,
-  });
-
-  // Now do the heavy lifting asynchronously
+async function processQuestion(text, user_name, response_url) {
   try {
-    // 1. Fetch all files from Drive
     console.log("Fetching file list from Drive...");
     const files = await listAllFiles(DRIVE_ROOT_FOLDER_ID);
     console.log(`Found ${files.length} files`);
 
-    // 2. Read file contents (in parallel, with limit)
     const CONCURRENCY = 5;
     const fileContents = [];
     for (let i = 0; i < files.length; i += CONCURRENCY) {
@@ -187,15 +146,12 @@ app.post("/slack/ask", async (req, res) => {
       const results = await Promise.all(batch.map(getFileText));
       fileContents.push(...results.filter(Boolean));
     }
-
     console.log(`Successfully read ${fileContents.length} files`);
 
-    // 3. Build context block for Claude
     const contextBlock = fileContents
       .map((f) => `=== FILE: ${f.name} ===\n${f.content}`)
       .join("\n\n");
 
-    // 4. Call Claude
     console.log("Calling Claude...");
     const message = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
@@ -211,7 +167,6 @@ app.post("/slack/ask", async (req, res) => {
 
     const answer = message.content[0].text;
 
-    // 5. Post the answer back to Slack
     await fetch(response_url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -224,16 +179,39 @@ app.post("/slack/ask", async (req, res) => {
 
     console.log("Response sent to Slack successfully");
   } catch (err) {
-    console.error("Error processing /ask command:", err);
+    console.error("Error in background processor:", err);
     await fetch(response_url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         response_type: "ephemeral",
-        text: `❌ Something went wrong while processing your question: ${err.message}`,
+        text: `❌ Something went wrong: ${err.message}`,
       }),
     });
   }
+}
+
+// ── Route: /slack/ask ─────────────────────────────────────────────────────────
+
+app.post("/slack/ask", (req, res) => {
+  const { text, user_name, response_url } = req.body;
+
+  // Step 1: Respond to Slack IMMEDIATELY (must happen within 3 seconds)
+  if (!text || text.trim() === "") {
+    return res.status(200).json({
+      response_type: "ephemeral",
+      text: "Please provide a question. Usage: `/ask Who is the best candidate for Head of FSSC?`",
+    });
+  }
+
+  // Send the immediate acknowledgment — this satisfies Slack's 3s requirement
+  res.status(200).json({
+    response_type: "in_channel",
+    text: `🔍 *${user_name}* asked: _${text}_\n⏳ Searching candidate files... (this takes ~30 seconds)`,
+  });
+
+  // Step 2: Do all the heavy work AFTER responding, in the background
+  processQuestion(text, user_name, response_url);
 });
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -245,6 +223,4 @@ app.get("/health", (req, res) => res.json({ status: "ok" }));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Slack Claude Bot running on port ${PORT}`);
-  console.log(`   POST /slack/ask  — handles /ask slash commands`);
-  console.log(`   GET  /health     — health check`);
 });
