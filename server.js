@@ -129,6 +129,8 @@ async function listAllFiles(drive, folderId, maxFiles = 60) {
       q: `'${currentFolder}' in parents and trashed = false`,
       fields: "files(id, name, mimeType)",
       pageSize: 100,
+      includeItemsFromAllDrives: true,
+      supportsAllDrives: true,
     });
     for (const file of res.data.files || []) {
       if (file.mimeType === "application/vnd.google-apps.folder") {
@@ -146,7 +148,7 @@ async function getFileText(drive, file) {
     let content = "";
     if (file.mimeType === "application/vnd.google-apps.document") {
       const res = await drive.files.export(
-        { fileId: file.id, mimeType: "text/plain" },
+        { fileId: file.id, mimeType: "text/plain", supportsAllDrives: true },
         { responseType: "text" }
       );
       content = res.data;
@@ -155,18 +157,18 @@ async function getFileText(drive, file) {
       file.mimeType === "application/msword"
     ) {
       const res = await drive.files.export(
-        { fileId: file.id, mimeType: "text/plain" },
+        { fileId: file.id, mimeType: "text/plain", supportsAllDrives: true },
         { responseType: "text" }
       ).catch(async () => {
         return await drive.files.get(
-          { fileId: file.id, alt: "media" },
+          { fileId: file.id, alt: "media", supportsAllDrives: true },
           { responseType: "text" }
         );
       });
       content = res.data;
     } else if (file.mimeType === "text/plain") {
       const res = await drive.files.get(
-        { fileId: file.id, alt: "media" },
+        { fileId: file.id, alt: "media", supportsAllDrives: true },
         { responseType: "text" }
       );
       content = res.data;
@@ -203,4 +205,3 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`✅ Slack Claude Bot running on port ${PORT}`);
 });
-
